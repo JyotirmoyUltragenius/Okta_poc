@@ -2,10 +2,10 @@ import streamlit as st
 import requests
 import json
 import os
-from datetime import datetime, timedelta, timezone
+import time
 from dotenv import load_dotenv
-import google.generativeai as genai  # Import the google-generativeai module
-
+import google.generativeai as genai
+import google.api_core.exceptions
 
 # Load environment variables
 load_dotenv()
@@ -15,6 +15,10 @@ JIRA_DOMAIN = os.getenv("JIRA_DOMAIN")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY")
+GENAI_API_KEY = os.getenv("GENAI_API_KEY")
+
+# Configure the generative AI client
+genai.configure(api_key=GENAI_API_KEY)
 
 # API Headers
 headers = {
@@ -22,12 +26,20 @@ headers = {
     "Content-Type": "application/json"
 }
 
-# Function to interact with Gemini
-
-def prompt_gemini(prompt):
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    response = model.generate_content(prompt)
-    return response.text
+# Function to interact with Gemini with retries
+def prompt_gemini(prompt, max_retries=5):
+    model = genai.GenerativeModel(model="models/gemini-1.5-flash")
+    delay = 1  # Initial delay in seconds
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(prompt, request_options={"timeout": 600})
+            return response.text
+        except google.api_core.exceptions.DeadlineExceeded as e:
+            st.warning(f"Attempt {attempt + 1} failed: {e}")
+            time.sleep(delay)
+            delay *= 2  # Exponential backoff
+    st.error("Max retries exceeded while trying to connect to Gemini API.")
+    return ""
 
 # Function to create a JIRA issue
 def create_jira_issue(summary, description, issue_type="Task", parent_key=None):
@@ -71,10 +83,13 @@ if submit_button:
         cluster_summary = prompt_gemini(f"Summarize this issue: {title}")
         cluster_description = prompt_gemini(f"Summarize this description: {description}")
         
-        parent_key = create_jira_issue(cluster_summary, cluster_description)
-        if parent_key:
-            st.success(f"Cluster Created Successfully! Parent Issue Key: {parent_key}")
+        if cluster_summary and cluster_description:
+            parent_key = create_jira_issue(cluster_summary, cluster_description)
+            if parent_key:
+                st.success(f"Cluster Created Successfully! Parent Issue Key: {parent_key}")
+            else:
+                st.error("Failed to create cluster")
         else:
-            st.error("Failed to create cluster")
+            st.error("Failed to generate cluster summary or description from Gemini API.")
     else:
         st.error("Please fill in both title and description fields.")
