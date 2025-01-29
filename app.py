@@ -4,6 +4,8 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
+import google.generativeai as genai  # Import the google-generativeai module
+
 
 # Load environment variables
 load_dotenv()
