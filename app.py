@@ -4,79 +4,89 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
+import pandas as pd
 
-# Load environment variables from .env
+# Load environment variables
 load_dotenv()
 
-# ✅ OKTA CONFIGURATION
-OKTA_CONFIG = {
-    "domain": os.getenv("OKTA_DOMAIN", "https://<your-okta-domain>.okta.com"),
-    "client_id": os.getenv("OKTA_CLIENT_ID", "<your-client-id>"),
-    "client_secret": os.getenv("OKTA_CLIENT_SECRET", "<your-client-secret>"),
-    "authorization_server_id": os.getenv("OKTA_AUTH_SERVER_ID", "<your-auth-server-id>"),
-    "token_endpoint": os.getenv("OKTA_TOKEN_ENDPOINT", "/oauth2/default/v1/token"),
+# OKTA and JIRA Configuration
+JIRA_DOMAIN = os.getenv("JIRA_DOMAIN")
+JIRA_EMAIL = os.getenv("JIRA_EMAIL")
+JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
+JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY")
+
+# API Headers
+headers = {
+    "Accept": "application/json",
+    "Content-Type": "application/json"
 }
 
-TOKEN_CACHE_FILE = "okta_token.json"
-EXPIRY_BUFFER = 300  # Request new token if it's about to expire in 5 mins
+# Function to interact with Gemini
 
+def prompt_gemini(prompt):
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    response = model.generate_content(prompt)
+    return response.text
 
-# ✅ Function to Fetch Token
-def get_okta_token():
-    if os.path.exists(TOKEN_CACHE_FILE):
-        with open(TOKEN_CACHE_FILE, "r") as f:
-            token_data = json.load(f)
-            expiry_time = datetime.fromisoformat(token_data["expiry"]).replace(tzinfo=timezone.utc)
-            if expiry_time > datetime.now(timezone.utc) + timedelta(seconds=EXPIRY_BUFFER):
-                return token_data["access_token"]
-
-    # Fetch a new token
-    url = OKTA_CONFIG["domain"] + OKTA_CONFIG["token_endpoint"]
+# Function to create a JIRA issue
+def create_jira_issue(summary, description, issue_type="Task", parent_key=None):
+    url = f"https://{JIRA_DOMAIN}/rest/api/3/issue"
     payload = {
-        "grant_type": "client_credentials",
-        "client_id": OKTA_CONFIG["client_id"],
-        "client_secret": OKTA_CONFIG["client_secret"],
-        "scope": "openid profile email",
+        "fields": {
+            "project": {"key": JIRA_PROJECT_KEY},
+            "summary": summary,
+            "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [{
+                    "type": "paragraph",
+                    "content": [{
+                        "text": description,
+                        "type": "text"
+                    }]
+                }]
+            },
+            "issuetype": {"name": issue_type}
+        }
     }
+    if parent_key:
+        payload["fields"]["parent"] = {"key": parent_key}
     
-    response = requests.post(url, data=payload)
-    response.raise_for_status()
-    token_data = response.json()
-    token_data["expiry"] = (datetime.now(timezone.utc) + timedelta(seconds=token_data["expires_in"])).isoformat()
+    response = requests.post(url, headers=headers, auth=(JIRA_EMAIL, JIRA_API_TOKEN), data=json.dumps(payload))
+    if response.status_code == 201:
+        return response.json()["key"]
+    return None
 
-    # Cache token
-    with open(TOKEN_CACHE_FILE, "w") as f:
-        json.dump(token_data, f)
+# Streamlit UI
+st.title("JIRA Issue Management with ServiceNow Integration")
 
-    return token_data["access_token"]
+uploaded_file = st.file_uploader("Upload ServiceNow CSV", type=["csv"])
+if uploaded_file is not None:
+    df = pd.read_csv(uploaded_file)
+    st.write(df.head())
 
+    cluster_options = df['cluster'].unique().tolist()
+    cluster_choice = st.selectbox("Select Cluster", cluster_options)
+    cluster_df = df[df['cluster'] == cluster_choice]
 
-# ✅ Streamlit UI
-st.title("🔐 Okta-Authenticated API")
-
-# Fetch token button
-if st.button("Get Okta Token"):
-    try:
-        token = get_okta_token()
-        st.success("✅ Token fetched successfully!")
-        st.code(token, language="plaintext")
-    except Exception as e:
-        st.error(f"❌ Error: {str(e)}")
-
-# API Request section
-st.subheader("🌍 Fetch Protected API Data")
-api_url = st.text_input("Enter API URL:", "https://api.example.com/resource")
-
-if st.button("Fetch Data"):
-    token = get_okta_token()
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    try:
-        response = requests.get(api_url, headers=headers)
-        response.raise_for_status()
-        st.json(response.json())  # Display JSON response
-    except requests.exceptions.RequestException as e:
-        st.error(f"❌ API Request Failed: {str(e)}")
-
-st.write("🚀 Developed with Streamlit & Okta")
-
+    if st.button("Create JIRA Issues"):
+        ticket_ids = cluster_df['Ticket ID'].tolist()
+        ticket_titles = ', '.join(cluster_df['Title'].tolist())
+        summary = prompt_gemini(f"Summarize these tickets: {ticket_titles}")
+        
+        descriptions = '\n'.join(cluster_df['Description'].tolist())
+        description_summary = prompt_gemini(f"Summarize these descriptions: {descriptions}")
+        
+        parent_key = create_jira_issue(summary, description_summary)
+        if parent_key:
+            st.success(f"Created Parent Issue: {parent_key}")
+            for index, row in cluster_df.iterrows():
+                subtask_summary = row['Title']
+                subtask_description = row['Description']
+                subtask_key = create_jira_issue(subtask_summary, subtask_description, "Subtask", parent_key)
+                if subtask_key:
+                    st.write(f"Subtask Created: {subtask_key}")
+                else:
+                    st.error("Failed to create subtask")
+        else:
+            st.error("Failed to create parent issue")
